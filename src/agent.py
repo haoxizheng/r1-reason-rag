@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 import os
 from src.prompts import Prompts
 from src.llm import r1
-from src.logging import log_event, initial_logger
+from src.logging_ import log_event, initial_logger
 from src.utils import console
 import json
 import re
@@ -18,12 +18,14 @@ import streamlit as st
 from streamlit_mermaid import st_mermaid
 from queue import Queue
 import uuid
+import glob
 load_dotenv()
+
 now = datetime.now().strftime("%Y-%m-%d")
 
 global MAX_LOOP_COUNT
 MAX_LOOP_COUNT = 5
-
+date_format = "%Y-%m-%d %H:%M:%S"
 
    
 class GraphState(TypedDict):
@@ -35,7 +37,11 @@ class GraphState(TypedDict):
     missing_information: str
     reasoning: str
     useful_information: str
+    useful_quote:list[str]
     loop_count: int
+    outline_start_time: str
+    search_count: int
+    data_agent_count: int
 
 
 class QAAgent:
@@ -45,8 +51,9 @@ class QAAgent:
         self.workflow = self.create_workflow()
 
     def fc(self, question):
-        # 根据question生成fc_querys                 
+        # 根据question生成fc_querys，返回的是action                
         
+        #根据把输入问题和时间插入template中
         prompt = Prompts.GEN_FC_QUERY.invoke({"question": question, "now": now}).text
         messages = [
             {"role": "user", "content": prompt}
@@ -66,9 +73,9 @@ class QAAgent:
 
         return response
     
-    def get_useful_info(self, question, retrieved_context):
+    def get_useful_info(self, question, retrieved_context, quote):
         # 获得有用的信息
-        prompt = Prompts.GEN_USEFUL_INFO.invoke({"retrieved_context": retrieved_context, "question": question, "now": now}).text
+        prompt = Prompts.GEN_USEFUL_INFO.invoke({"retrieved_context": retrieved_context, "question": question, "now": now, "quote":quote}).text
         messages = [
             {"role": "user", "content": prompt}
         ]
@@ -83,25 +90,48 @@ class QAAgent:
 
     def retrieve(self, state: GraphState):
         # print("\n=== STEP 1: RETRIEVAL ===")
+        outline_start_time = datetime.now().strftime(date_format)
+        search_count = 0
+        data_agent_count = 0
 
-        # 对原始questions进行fc
+        # 对子questions进行fc
         question = state["question"]
         fc_querys = self.fc(question)
+
+        for item in fc_querys:
+            if item['name'] == 'search':
+                search_count += 1
+            elif item['name'] == 'data_agent':
+                data_agent_count += 1
 
         result = parallel_process(
             fc_querys,
             lambda q: self.tavily_client.search(q["question"]) if q['name'] == "search" else self.data_client.ifind_data(q['question'])
         )
+
+
         
         result = list(itertools.chain.from_iterable(result))
         retrieved_context = "\n---\n".join([r.get("content","") for r in result])
         retrieve_context_lst = str([r.get("content","") for r in result])
 
+
+
         # 获得有用的信息
         retrieved_search_content = "\n---\n".join([r.get("content","")[:4000] for r in result if r.get("type") == "search"])
-        useful_info = self.get_useful_info(question, retrieved_search_content)
-        useful_info = useful_info + "\n\n" + "\n---\n".join([r.get("content","")[:4000] for r in result if r.get("type") == "index"])
+        retrieved_search_quote = "\n---\n".join([r.get("url","") for r in result if r.get("type") == "search"])
+        useful_info_quote = self.get_useful_info(question, retrieved_search_content, retrieved_search_quote)
+        
 
+        try:
+            useful_info_quote = eval(re.findall(r"```(?:json)?\s*(.*?)\s*```", useful_info_quote, re.DOTALL)[0])
+        except:
+            console.print("useful_info_quote生成解析失败")
+            log_event("useful_info_quote生成解析失败")
+            
+
+        useful_info = "\n---\n".join([item["useful_information"] for item in useful_info_quote]) + "\n\n" + "\n---\n".join([r.get("content","")[:4000] for r in result if r.get("type") == "index"])
+        useful_quote =[item["quote"] for item in useful_info_quote]
 
         console.print(f"\n=== STEP 1: RETRIEVAL ===\nSearching for: {question}\nfc_query:{fc_querys}\nRetrieved Context: \n...\nUseful info: {useful_info}")
         log_event(f"\n=== STEP 1: RETRIEVAL ===\nSearching for: {question}\nfc_query:{fc_querys}\nRetrieved Context: \n{retrieve_context_lst}\n Useful info:{useful_info}")
@@ -111,7 +141,7 @@ class QAAgent:
 
         if hasattr(self, 'message_callback'):
             self.message_callback(f"\n=== STEP 1: RETRIEVAL ===\nSearching for: {question}\nfc_query:{fc_querys}\nRetrieved Context: \n...\nUseful info: {useful_info}")
-        return {"retrieved_context": retrieved_context, "useful_information": useful_info}
+        return {"retrieved_context": retrieved_context, "useful_information": useful_info, "useful_quote": useful_quote,"outline_start_time": outline_start_time,"search_count": search_count,  "data_agent_count": data_agent_count}
 
     def validate_retrieval(self, state: GraphState):
         # print("\n=== STEP 2: VALIDATION ===")
@@ -171,6 +201,11 @@ class QAAgent:
         question = state["question"]
         context = state["retrieved_context"]
         useful_information = state['useful_information']
+        useful_quote = state["useful_quote"]
+        outline_start_time = state['outline_start_time']
+        loop_count = state['loop_count']
+        search_count = state["search_count"]
+        data_agent_count = state["data_agent_count"]
 
         prompt = Prompts.ANSWER_QUESTION.invoke({"useful_information": useful_information, "question": question, "now": now}).text
         messages = [
@@ -190,6 +225,10 @@ class QAAgent:
         if hasattr(self, 'message_callback'):
             self.message_callback(f"\n=== STEP 3: ANSWERING ===\nglobal question: {question}\nfinal_answer: {answer}")
 
+        parsed_date = datetime.strptime(outline_start_time, date_format)
+        outline_time = datetime.now() - parsed_date
+        print(f"\n outline: {question}\n cost time: {outline_time}s\n loop count: {loop_count}\n search_count: {search_count}\n data_agent_count: {data_agent_count}\n answer length: {len(answer)}\n useful_quote: {useful_quote}")
+        log_event(f"\n outline: {question}\n cost time: {outline_time}s\n loop count: {loop_count}\n search_count: {search_count}\n data_agent_count: {data_agent_count}\n answer length: {len(answer)}\n useful_quote: {useful_quote}")
         return {"answer_to_question": answer, "retrieved_context": context, "useful_information": state['useful_information'] }
 
     def find_missing_information(self, state: GraphState):
@@ -197,10 +236,19 @@ class QAAgent:
 
         question = state['question']
         missing_information = state["missing_information"]
+        search_count = state["search_count"]
+        data_agent_count = state["data_agent_count"]
+        previously_retrieved_useful_quote = state["useful_quote"]
 
         # 对missing_information进行fc
         fc_querys = self.fc(missing_information)
 
+        for item in fc_querys:
+            if item['name'] == 'search':
+                search_count += 1
+            elif item['name'] == 'data_agent':
+                data_agent_count += 1
+        
         tavily_query = parallel_process(
             fc_querys,
             lambda q: self.tavily_client.search(q["question"]) if q['name'] == "search" else self.data_client.ifind_data(q['question'])
@@ -214,9 +262,18 @@ class QAAgent:
 
         # 获得新的有用的信息
         newly_retrieved_search_content = "\n---\n".join([r.get("content","")[:4000] for r in tavily_query if r.get("type") == "search"])
-        newly_useful_info = self.get_useful_info(question, newly_retrieved_search_content)
-        newly_useful_info = newly_useful_info + "\n\n" + "\n---\n".join([r.get("content","")[:4000] for r in tavily_query if r.get("type") == "index"])
+        newly_retrieved_search_quote = "\n---\n".join([r.get("url","") for r in tavily_query if r.get("type") == "search"])
+        
+        newly_useful_info_quote = self.get_useful_info(question, newly_retrieved_search_content, newly_retrieved_search_quote)
+        
+        try:
+            newly_useful_info_quote = eval(re.findall(r"```(?:json)?\s*(.*?)\s*```", newly_useful_info_quote, re.DOTALL)[0])
+        except:
+            console.print("useful_info_quote生成解析失败")
+            log_event("useful_info_quote生成解析失败")
 
+        newly_useful_info = "\n---\n".join([item["useful_information"] for item in newly_useful_info_quote]) + "\n\n" + "\n---\n".join([r.get("content","")[:4000] for r in tavily_query if r.get("type") == "index"])
+        useful_quote = previously_retrieved_useful_quote + [item["quote"] for item in newly_useful_info_quote]
 
         console.print(f"\n=== STEP 2b: FINDING MISSING INFORMATION ===\nglobal question: {question}\nSearching for missing:{missing_information}\nfc_querys:{fc_querys}\nNewly retrieved context: \n...\nNewly useful info: {newly_useful_info}")
         log_event(f"\n=== STEP 2b: FINDING MISSING INFORMATION ===\nglobal question: {question}\nSearching for missing:{missing_information}\nfc_querys:{fc_querys}\nNewly retrieved context: \n{newly_retrieved_context_lst}\nNewly useful info: {newly_useful_info}")
@@ -228,7 +285,7 @@ class QAAgent:
 
         combined_context = f"{previously_retrieved_useful_information}\n{newly_useful_info}"
         # print("newly retrieved context:", newly_retrieved_context)
-        return {"useful_information": combined_context}
+        return {"useful_information": combined_context, "search_count": search_count,  "data_agent_count": data_agent_count, "useful_quote":useful_quote}
 
     @staticmethod
     def decide_route(state: GraphState):
@@ -287,9 +344,11 @@ class QAAgent:
         messages = [
             {"role": "user", "content": prompt}
         ]
+        
         llm_output = r1.chat.completions.create(
             model="ep-20250208165153-wn9ft", messages=messages
         )
+        
         reasoning = llm_output.choices[0].message.reasoning_content.strip()
         answer = llm_output.choices[0].message.content.strip()
         answer = eval(re.findall(r"```(?:json)?\s*(.*?)\s*```", answer, re.DOTALL)[0])
@@ -371,7 +430,7 @@ class QAAgent:
 
 
     def run(self, question: str, polish: bool = False, polish_step: int = -1, max_outline_num: int = 8, max_loop: int = 5):     
-        # 先生成一个大纲，然后每个大纲去调用 workflow.invoke
+        # 先生成一个大纲，然后每个子标题去调用 workflow.invoke
         global MAX_LOOP_COUNT
         MAX_LOOP_COUNT = max_loop
 
@@ -395,10 +454,13 @@ class QAAgent:
         start_time = datetime.now()
         initial_logger(logging_path="logs", enable_stdout=False, log_file_name=f"{question}_{start_time.strftime('%Y%m%d%H%M%S')}")
 
+
+        #让大模型把问题拆成子标题和研究目标
         outlines = self.gen_outline(question, max_outline_num)
         with st.chat_message("assistant"):
             st.markdown(f"Init Outlines:\n{str(outlines)}")
         outlines_lst = [f"请以‘{question}’为标题，‘{item['headings']}’为子标题，展开深度研究，研究目标为‘{item['research_goal']}’" for item in outlines]
+
 
         with st.chat_message("assistant"):
             st.markdown(f"==== 并行查找资料中，请耐心等待 ====")
@@ -444,6 +506,9 @@ class QAAgent:
         #     st.markdown(log_content)
 
         return final_report
+    
+  
+
 
 if __name__ == "__main__":
     agent = QAAgent()

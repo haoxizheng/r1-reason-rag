@@ -76,26 +76,50 @@ class Prompts:
         The Question: {question}
         Outline:"""
     )
+
     GEN_USEFUL_INFO = PromptTemplate(
-        input_variables=["retrieved_context", "question", "now"],
+        input_variables=["retrieved_context","quote", "question", "now"],
         template="""
-        You are a useful information generator agent. Today is {now}.
-        You will be provided with a question and chunks of text that may or may not contain the answer to the question.
-        Your role is to carefullylook through the chunks of text provide the useful information from the retrieved chunks.
+    You are a useful information generator agent.  Today is {now}.  
+    You will be provided with a question, chunks of text that may or may not contain the answer to the question, and the corresponding citations for each chunk of text.  Your role is to carefully review the chunks of text and extract the useful information from the retrieved chunks.  Additionally, you must provide the corresponding citations for the useful information.  The order of the text chunks and the order of the citations are aligned.
+    
+    Here are the requirements:
+    - Remember, you must return both useful information and citations.  Retain the original citations.
+    - If there is no useful information, set this to an empty string.
+    - Please retain the information subject in the original information, as well as digital information, news policy information, reported news, etc.
+    - Please retain the information that you don't know.
+    - Return the useful information in an extremely detailed version, and return the additional context (if relevant).
+    - Please make sure that the numerical values, news information in the 'Useful Information' are all from the 'Context'.
+    - Please provide your response as a dictionary in the following format:
 
-        Here is the requirement:
-        - if there is no useful information, set this to an empty string
-        - Please retain the information subject in the original information, as well as digital information, news policy information, reported news, etc.
-        - Please retain the information that you don't know.
-        - Return the useful information in extremely detailed version, and return the additional context (if relevant):
-        - Please make sure that the numerical value, news information in the 'Useful Information' are all from the 'Context'.
 
-        Context: {retrieved_context}
+    Please response in the following format, returns a json list:
+        ```json
+        [
+        {{'useful_information': 'xxx', 'quote': 'xxx'}},
+        {{'useful_information': 'xxx', 'quote': 'xxx'}},
+        ...
+        ]
+        ```
 
-        The Question: {question}
-        Useful Information:
-        """
+    Here is an example of the response format:
+        
+        ```json
+        [
+        {{'useful_information': '"The capital city of Mexico is Mexico City."', 'quote': 'https://simple.wikipedia.org/wiki/Mexico_City'}},
+        ...
+        ]
+        ```
+
+    Context: {retrieved_context}
+    Quote:{quote}
+    The Question: {question}
+    Useful Information:"""
     )
+
+
+
+
     VALIDATE_RETRIEVAL = PromptTemplate(
         input_variables=["useful_information", "question", "now"],
         template="""
